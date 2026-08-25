@@ -27,6 +27,11 @@ struct sg2002_ghash_ctx {
 		   [SG2002_GHASH_NIBBLE_VALUES];
 };
 
+struct sg2002_ghash_desc_ctx {
+	u8 buffer[GHASH_BLOCK_SIZE];
+	unsigned int bytes;
+};
+
 static u16 sg2002_x8_reduction[256];
 
 static void sg2002_gf128mul_x8_lle(be128 *value)
@@ -129,7 +134,7 @@ static void sg2002_ghash_multiply(be128 *value,
 
 static int sg2002_ghash_init(struct shash_desc *desc)
 {
-	struct ghash_desc_ctx *dctx = shash_desc_ctx(desc);
+	struct sg2002_ghash_desc_ctx *dctx = shash_desc_ctx(desc);
 
 	memset(dctx, 0, sizeof(*dctx));
 	return 0;
@@ -138,7 +143,7 @@ static int sg2002_ghash_init(struct shash_desc *desc)
 static int sg2002_ghash_update(struct shash_desc *desc, const u8 *src,
 			       unsigned int srclen)
 {
-	struct ghash_desc_ctx *dctx = shash_desc_ctx(desc);
+	struct sg2002_ghash_desc_ctx *dctx = shash_desc_ctx(desc);
 	struct sg2002_ghash_ctx *ctx = crypto_shash_ctx(desc->tfm);
 	u8 *dst = dctx->buffer;
 
@@ -171,7 +176,7 @@ static int sg2002_ghash_update(struct shash_desc *desc, const u8 *src,
 
 static int sg2002_ghash_final(struct shash_desc *desc, u8 *output)
 {
-	struct ghash_desc_ctx *dctx = shash_desc_ctx(desc);
+	struct sg2002_ghash_desc_ctx *dctx = shash_desc_ctx(desc);
 	struct sg2002_ghash_ctx *ctx = crypto_shash_ctx(desc->tfm);
 
 	if (dctx->bytes)
@@ -187,7 +192,7 @@ static int sg2002_ghash_final(struct shash_desc *desc, u8 *output)
 	.update = sg2002_ghash_update, \
 	.final = sg2002_ghash_final, \
 	.setkey = sg2002_ghash_setkey, \
-	.descsize = sizeof(struct ghash_desc_ctx), \
+	.descsize = sizeof(struct sg2002_ghash_desc_ctx), \
 	.base = { \
 		.cra_name = "ghash", \
 		.cra_driver_name = (_driver), \

@@ -3,6 +3,7 @@
 
 #include <crypto/aes.h>
 #include <crypto/hash.h>
+#include <crypto/internal/cipher.h>
 #include <linux/atomic.h>
 #include <linux/crypto.h>
 #include <linux/device.h>
@@ -11,15 +12,14 @@
 #include <linux/ioctl.h>
 #include <linux/ktime.h>
 #include <linux/miscdevice.h>
-#include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
-#include <linux/platform_device.h>
 #include <linux/scatterlist.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/uaccess.h>
-#include <asm/unaligned.h>
+#include <linux/unaligned.h>
+#include <linux/version.h>
 
 #include "onekvm_sg2002_cryptodma.h"
 
@@ -32,10 +32,7 @@
 #define ONEKVM_OFFLOAD_GCM_TAG_SIZE 16
 #define ONEKVM_OFFLOAD_MAX_INPUT (20 * 1024)
 #define ONEKVM_OFFLOAD_MAX_BATCH 128
-#define ONEKVM_SPACC_BASE 0x02060000
-#define ONEKVM_SPACC_SIZE 0x200
-#define ONEKVM_OFFLOAD_MAX_PAGES \
-	DIV_ROUND_UP(ONEKVM_OFFLOAD_MAX_INPUT + PAGE_SIZE - 1, PAGE_SIZE)
+#define ONEKVM_OFFLOAD_BATCH_BUFFER_SIZE (32 * 1024)
 
 struct onekvm_offload_key_config {
 	__u32 version;
@@ -76,36 +73,16 @@ static_assert(sizeof(struct onekvm_offload_batch_request) == 24);
 #define ONEKVM_OFFLOAD_ENCRYPT_BATCH \
 	_IOWR(ONEKVM_OFFLOAD_IOCTL_TYPE, 0x03, struct onekvm_offload_batch_request)
 
-struct onekvm_offload_user_buffer;
-struct onekvm_offload_batch_page;
-
 struct onekvm_offload_context {
 	struct mutex lock;
 	struct crypto_shash *ghash;
 	struct shash_desc *ghash_desc;
 	struct crypto_cipher *aes;
 	u8 *input;
-	struct onekvm_offload_user_buffer *batch_buffers;
-	struct onekvm_offload_batch_page *batch_pages;
+	u8 *batch_data;
+	u8 *batch_keystream;
 	u8 key[AES_MAX_KEY_SIZE];
 	unsigned int key_len;
-};
-
-struct onekvm_offload_user_buffer {
-	struct page *pages[ONEKVM_OFFLOAD_MAX_PAGES];
-	struct scatterlist scatterlist[ONEKVM_OFFLOAD_MAX_PAGES];
-	unsigned int page_count;
-	bool writable;
-};
-
-struct onekvm_offload_batch_page {
-	unsigned long user_address;
-	struct page *page;
-};
-
-struct onekvm_offload_batch_pins {
-	struct onekvm_offload_batch_page *pages;
-	unsigned int count;
 };
 
 static bool onekvm_offload_ranges_overlap(unsigned long first,
@@ -126,10 +103,6 @@ static atomic64_t offload_batch_packets = ATOMIC64_INIT(0);
 static atomic64_t offload_batch_unique_pages = ATOMIC64_INIT(0);
 static char offload_driver_name[CRYPTO_MAX_ALG_NAME] = "unconfigured";
 static DEFINE_MUTEX(offload_driver_name_lock);
-static bool deduplicate_batch_pages = true;
-module_param(deduplicate_batch_pages, bool, 0444);
-MODULE_PARM_DESC(deduplicate_batch_pages,
-	"pin each unique in-place userspace page once per batch");
 
 static void onekvm_offload_free_crypto(struct onekvm_offload_context *context)
 {
@@ -292,144 +265,6 @@ static int onekvm_offload_ghash(struct onekvm_offload_context *context,
 	return error;
 }
 
-static void onekvm_offload_unpin_user_buffer(
-	struct onekvm_offload_user_buffer *buffer)
-{
-	unsigned int index;
-
-	for (index = 0; index < buffer->page_count; index++) {
-		if (buffer->writable)
-			set_page_dirty_lock(buffer->pages[index]);
-		unpin_user_page(buffer->pages[index]);
-	}
-	buffer->page_count = 0;
-}
-
-static int onekvm_offload_pin_user_buffer(
-	struct onekvm_offload_user_buffer *buffer, u64 pointer,
-	size_t length, bool writable)
-{
-	unsigned long address;
-	unsigned long page_address;
-	unsigned int page_offset;
-	unsigned int page_count;
-	unsigned int index;
-	unsigned int count;
-	unsigned int remaining = length;
-	long pinned;
-
-	memset(buffer, 0, sizeof(*buffer));
-	if (!length)
-		return 0;
-	if (pointer > ULONG_MAX)
-		return -EFAULT;
-	address = (unsigned long)pointer;
-	if (length > ULONG_MAX - address)
-		return -EFAULT;
-	page_offset = offset_in_page(address);
-	page_count = DIV_ROUND_UP(page_offset + length, PAGE_SIZE);
-	if (page_count > ONEKVM_OFFLOAD_MAX_PAGES)
-		return -EMSGSIZE;
-	page_address = address & PAGE_MASK;
-	pinned = pin_user_pages_fast(page_address, page_count,
-				     writable ? FOLL_WRITE : 0,
-				     buffer->pages);
-	if (pinned != page_count) {
-		if (pinned > 0) {
-			buffer->page_count = pinned;
-			onekvm_offload_unpin_user_buffer(buffer);
-		}
-		return pinned < 0 ? pinned : -EFAULT;
-	}
-
-	buffer->page_count = page_count;
-	buffer->writable = writable;
-	sg_init_table(buffer->scatterlist, page_count);
-	for (index = 0; index < page_count; index++) {
-		count = min_t(unsigned int, remaining,
-				  PAGE_SIZE - page_offset);
-		sg_set_page(&buffer->scatterlist[index], buffer->pages[index],
-			    count, page_offset);
-		remaining -= count;
-		page_offset = 0;
-	}
-	return 0;
-}
-
-static void onekvm_offload_release_batch_pins(
-	struct onekvm_offload_batch_pins *pins)
-{
-	unsigned int index;
-
-	for (index = 0; index < pins->count; index++) {
-		set_page_dirty_lock(pins->pages[index].page);
-		unpin_user_page(pins->pages[index].page);
-	}
-	memset(pins->pages, 0,
-	       pins->count * sizeof(struct onekvm_offload_batch_page));
-	pins->count = 0;
-}
-
-static int onekvm_offload_pin_batch_buffer(
-	struct onekvm_offload_user_buffer *buffer, u64 pointer, size_t length,
-	struct onekvm_offload_batch_pins *pins)
-{
-	unsigned long address;
-	unsigned long user_page;
-	unsigned int page_offset;
-	unsigned int page_count;
-	unsigned int page_index;
-	unsigned int cache_index;
-	unsigned int count;
-	unsigned int remaining = length;
-	struct page *page;
-	long pinned;
-
-	memset(buffer, 0, sizeof(*buffer));
-	if (!length)
-		return 0;
-	if (pointer > ULONG_MAX)
-		return -EFAULT;
-	address = (unsigned long)pointer;
-	if (length > ULONG_MAX - address)
-		return -EFAULT;
-	page_offset = offset_in_page(address);
-	page_count = DIV_ROUND_UP(page_offset + length, PAGE_SIZE);
-	if (page_count > ONEKVM_OFFLOAD_MAX_PAGES)
-		return -EMSGSIZE;
-	user_page = address & PAGE_MASK;
-	buffer->page_count = page_count;
-	sg_init_table(buffer->scatterlist, page_count);
-	for (page_index = 0; page_index < page_count; page_index++) {
-		page = NULL;
-		for (cache_index = 0; cache_index < pins->count;
-		     cache_index++) {
-			if (pins->pages[cache_index].user_address == user_page) {
-				page = pins->pages[cache_index].page;
-				break;
-			}
-		}
-		if (!page) {
-			pinned = pin_user_pages_fast(user_page, 1, FOLL_WRITE,
-						     &page);
-			if (pinned != 1)
-				return pinned < 0 ? pinned : -EFAULT;
-			pins->pages[pins->count].user_address = user_page;
-			pins->pages[pins->count].page = page;
-			pins->count++;
-		}
-		buffer->pages[page_index] = page;
-		count = min_t(unsigned int, remaining,
-				  PAGE_SIZE - page_offset);
-		sg_set_page(&buffer->scatterlist[page_index], page, count,
-			    page_offset);
-		remaining -= count;
-		page_offset = 0;
-		user_page += PAGE_SIZE;
-	}
-	return 0;
-}
-
 static int onekvm_offload_validate_encrypt_request(
 	struct onekvm_offload_context *context,
 	const struct onekvm_offload_encrypt_request *parameters)
@@ -496,14 +331,10 @@ clear_temporary:
 
 static int onekvm_offload_encrypt_parameters(
 	struct onekvm_offload_context *context,
-	const struct onekvm_offload_encrypt_request *request,
-	struct onekvm_offload_user_buffer *prepared_in_place)
+	const struct onekvm_offload_encrypt_request *request)
 {
 	struct onekvm_offload_encrypt_request parameters = *request;
-	struct onekvm_offload_user_buffer source_buffer = { };
-	struct onekvm_offload_user_buffer destination_buffer = { };
-	struct scatterlist *source_scatterlist;
-	struct scatterlist *destination_scatterlist;
+	struct scatterlist ciphertext;
 	void __user *src_user;
 	void __user *dst_user;
 	u64 started_ns;
@@ -525,54 +356,44 @@ static int onekvm_offload_encrypt_parameters(
 					  (unsigned long)dst_user,
 					  parameters.data_len))
 		return -EINVAL;
-	if (prepared_in_place) {
-		if (parameters.data_len && !in_place)
-			return -EINVAL;
-		source_scatterlist = prepared_in_place->scatterlist;
-		destination_scatterlist = prepared_in_place->scatterlist;
-	} else {
-		error = onekvm_offload_pin_user_buffer(&destination_buffer,
-						       parameters.dst_ptr,
-						       parameters.data_len, true);
-		if (error)
-			return error;
-		if (in_place) {
-			source_scatterlist = destination_buffer.scatterlist;
-		} else {
-			error = onekvm_offload_pin_user_buffer(&source_buffer,
-							       parameters.src_ptr,
-							       parameters.data_len,
-							       false);
-			if (error)
-				goto unpin_destination;
-			source_scatterlist = source_buffer.scatterlist;
-		}
-		destination_scatterlist = destination_buffer.scatterlist;
-	}
+
+	/* The CVITEK kernel API already copies every scatterlist into its own
+	 * contiguous DMA buffer. Pinning userspace pages here therefore adds GUP,
+	 * dirty-page and scatterlist overhead without removing a data copy. Stage
+	 * the small SRTP payload next to its AAD instead; this also keeps the hot
+	 * batch path independent of userspace page layout. */
+	if (parameters.data_len &&
+	    copy_from_user(context->input + parameters.aad_len, src_user,
+			   parameters.data_len))
+		return -EFAULT;
+	sg_init_one(&ciphertext, context->input + parameters.aad_len,
+		    parameters.data_len);
 
 	memcpy(counter, parameters.iv, ONEKVM_OFFLOAD_GCM_IV_SIZE);
 	put_unaligned_be32(2, counter + ONEKVM_OFFLOAD_GCM_IV_SIZE);
 	started_ns = ktime_get_ns();
 	if (parameters.data_len) {
 		error = cvitek_spacc_aes_ctr_encrypt_sg(
-			source_scatterlist, destination_scatterlist,
+			&ciphertext, &ciphertext,
 			parameters.data_len, context->key, context->key_len,
 			counter);
 		if (error)
 			goto clear_temporary;
+		if (copy_to_user(dst_user,
+				 context->input + parameters.aad_len,
+				 parameters.data_len)) {
+			error = -EFAULT;
+			goto clear_temporary;
+		}
 	}
-	error = onekvm_offload_finish_gcm(context, &parameters,
-		 destination_scatterlist);
+	error = onekvm_offload_finish_gcm(context, &parameters, &ciphertext);
 	if (error)
 		goto clear_temporary;
 	atomic64_add(ktime_get_ns() - started_ns, &offload_crypto_ns);
 clear_temporary:
 	memzero_explicit(counter, sizeof(counter));
-	if (!prepared_in_place && !in_place)
-		onekvm_offload_unpin_user_buffer(&source_buffer);
-unpin_destination:
-	if (!prepared_in_place)
-		onekvm_offload_unpin_user_buffer(&destination_buffer);
+	memzero_explicit(context->input,
+			 parameters.aad_len + parameters.data_len);
 	return error;
 }
 
@@ -583,7 +404,110 @@ static int onekvm_offload_encrypt(struct onekvm_offload_context *context,
 
 	if (copy_from_user(&parameters, argument, sizeof(parameters)))
 		return -EFAULT;
-	return onekvm_offload_encrypt_parameters(context, &parameters, NULL);
+	return onekvm_offload_encrypt_parameters(context, &parameters);
+}
+
+static int onekvm_offload_encrypt_batch_chunk(
+	struct onekvm_offload_context *context,
+	const struct onekvm_offload_encrypt_request *requests,
+	unsigned int request_count, unsigned int *completed)
+{
+	unsigned int data_offsets[ONEKVM_OFFLOAD_MAX_BATCH];
+	unsigned int keystream_offsets[ONEKVM_OFFLOAD_MAX_BATCH];
+	unsigned int data_used = 0;
+	unsigned int keystream_used = 0;
+	unsigned int chunk_count = 0;
+	unsigned int request_index;
+	u64 started_ns;
+	int error = 0;
+
+	*completed = 0;
+	while (chunk_count < request_count) {
+		const struct onekvm_offload_encrypt_request *request =
+			&requests[chunk_count];
+		unsigned int block_count = DIV_ROUND_UP(request->data_len,
+							 AES_BLOCK_SIZE);
+		unsigned int keystream_length = block_count * AES_BLOCK_SIZE;
+		void __user *src_user =
+			(void __user *)(uintptr_t)request->src_ptr;
+		void __user *dst_user =
+			(void __user *)(uintptr_t)request->dst_ptr;
+		unsigned int block;
+
+		if (data_used + request->data_len >
+				ONEKVM_OFFLOAD_BATCH_BUFFER_SIZE ||
+		    keystream_used + keystream_length >
+				ONEKVM_OFFLOAD_BATCH_BUFFER_SIZE)
+			break;
+		if (request->data_len && request->src_ptr != request->dst_ptr &&
+		    onekvm_offload_ranges_overlap((unsigned long)src_user,
+						  request->data_len,
+						  (unsigned long)dst_user,
+						  request->data_len)) {
+			error = -EINVAL;
+			goto clear_buffers;
+		}
+		if (request->data_len &&
+		    copy_from_user(context->batch_data + data_used, src_user,
+				   request->data_len)) {
+			error = -EFAULT;
+			goto clear_buffers;
+		}
+		data_offsets[chunk_count] = data_used;
+		keystream_offsets[chunk_count] = keystream_used;
+		for (block = 0; block < block_count; block++) {
+			u8 *counter = context->batch_keystream +
+				keystream_used + block * AES_BLOCK_SIZE;
+
+			memcpy(counter, request->iv, ONEKVM_OFFLOAD_GCM_IV_SIZE);
+			put_unaligned_be32(2 + block,
+				counter + ONEKVM_OFFLOAD_GCM_IV_SIZE);
+		}
+		data_used += request->data_len;
+		keystream_used += keystream_length;
+		chunk_count++;
+	}
+	if (!chunk_count)
+		return -EMSGSIZE;
+
+	started_ns = ktime_get_ns();
+	if (keystream_used) {
+		error = cvitek_spacc_aes_ecb_encrypt(context->batch_keystream,
+			keystream_used, context->key, context->key_len);
+		if (error)
+			goto clear_buffers;
+	}
+	for (request_index = 0; request_index < chunk_count;
+	     request_index++) {
+		const struct onekvm_offload_encrypt_request *request =
+			&requests[request_index];
+		struct scatterlist ciphertext;
+		void __user *dst_user =
+			(void __user *)(uintptr_t)request->dst_ptr;
+		u8 *data = context->batch_data + data_offsets[request_index];
+		u8 *keystream = context->batch_keystream +
+			keystream_offsets[request_index];
+		unsigned int byte;
+
+		for (byte = 0; byte < request->data_len; byte++)
+			data[byte] ^= keystream[byte];
+		if (request->data_len &&
+		    copy_to_user(dst_user, data, request->data_len)) {
+			error = -EFAULT;
+			goto clear_buffers;
+		}
+		sg_init_one(&ciphertext, data, request->data_len);
+		error = onekvm_offload_finish_gcm(context, request, &ciphertext);
+		if (error)
+			goto clear_buffers;
+		(*completed)++;
+	}
+	atomic64_add(ktime_get_ns() - started_ns, &offload_crypto_ns);
+
+clear_buffers:
+	memzero_explicit(context->batch_data, data_used);
+	memzero_explicit(context->batch_keystream, keystream_used);
+	return error;
 }
 
 static int onekvm_offload_encrypt_batch(
@@ -591,11 +515,9 @@ static int onekvm_offload_encrypt_batch(
 {
 	struct onekvm_offload_encrypt_request *requests;
 	struct onekvm_offload_batch_request batch;
-	struct onekvm_offload_batch_pins pins = { };
 	void __user *requests_user;
 	size_t requests_size;
 	unsigned int index;
-	bool deduplicate_pages = deduplicate_batch_pages;
 	int error = 0;
 
 	if (copy_from_user(&batch, argument, sizeof(batch)))
@@ -615,54 +537,21 @@ static int onekvm_offload_encrypt_batch(
 								 &requests[index]);
 		if (error)
 			goto complete;
-		if (requests[index].data_len &&
-		    requests[index].src_ptr != requests[index].dst_ptr)
-			deduplicate_pages = false;
-	}
-	if (deduplicate_pages) {
-		if (!context->batch_buffers)
-			context->batch_buffers = kvcalloc(
-				ONEKVM_OFFLOAD_MAX_BATCH,
-				sizeof(*context->batch_buffers), GFP_KERNEL);
-		if (!context->batch_pages)
-			context->batch_pages = kvcalloc(
-				ONEKVM_OFFLOAD_MAX_BATCH *
-					ONEKVM_OFFLOAD_MAX_PAGES,
-				sizeof(*context->batch_pages), GFP_KERNEL);
-		if (!context->batch_buffers || !context->batch_pages) {
-			error = -ENOMEM;
-			goto complete;
-		}
-		pins.pages = context->batch_pages;
-		for (index = 0; index < batch.count; index++) {
-			error = onekvm_offload_pin_batch_buffer(
-				&context->batch_buffers[index],
-				requests[index].dst_ptr,
-				requests[index].data_len, &pins);
-			if (error)
-				goto release_pins;
-		}
 	}
 
-	for (index = 0; index < batch.count; index++) {
-		error = onekvm_offload_encrypt_parameters(context,
-			&requests[index], deduplicate_pages ?
-				&context->batch_buffers[index] : NULL);
+	index = 0;
+	while (index < batch.count) {
+		unsigned int completed = 0;
+
+		error = onekvm_offload_encrypt_batch_chunk(context,
+			&requests[index], batch.count - index, &completed);
+		batch.completed += completed;
+		index += completed;
 		if (error)
 			break;
-		batch.completed++;
 	}
 	atomic64_inc(&offload_batch_calls);
 	atomic64_add(batch.completed, &offload_batch_packets);
-	if (deduplicate_pages)
-		atomic64_add(pins.count, &offload_batch_unique_pages);
-
-release_pins:
-	if (pins.pages)
-		onekvm_offload_release_batch_pins(&pins);
-	if (deduplicate_pages && context->batch_buffers)
-		memset(context->batch_buffers, 0,
-		       batch.count * sizeof(*context->batch_buffers));
 complete:
 	kfree_sensitive(requests);
 	if (copy_to_user(argument, &batch, sizeof(batch)) && !error)
@@ -709,14 +598,23 @@ static int onekvm_offload_open(struct inode *inode, struct file *file)
 		return -ENOMEM;
 	context->input = kmalloc(ONEKVM_OFFLOAD_MAX_INPUT +
 				ONEKVM_OFFLOAD_GCM_TAG_SIZE, GFP_KERNEL);
-	if (!context->input) {
-		kfree(context->input);
-		kfree(context);
-		return -ENOMEM;
-	}
+	context->batch_data = kmalloc(ONEKVM_OFFLOAD_BATCH_BUFFER_SIZE,
+				      GFP_KERNEL);
+	context->batch_keystream = kmalloc(ONEKVM_OFFLOAD_BATCH_BUFFER_SIZE,
+					   GFP_KERNEL);
+	if (!context->input || !context->batch_data ||
+	    !context->batch_keystream)
+		goto free_context;
 	mutex_init(&context->lock);
 	file->private_data = context;
 	return 0;
+
+free_context:
+	kfree(context->batch_keystream);
+	kfree(context->batch_data);
+	kfree(context->input);
+	kfree(context);
+	return -ENOMEM;
 }
 
 static int onekvm_offload_release(struct inode *inode, struct file *file)
@@ -727,10 +625,14 @@ static int onekvm_offload_release(struct inode *inode, struct file *file)
 		return 0;
 	mutex_lock(&context->lock);
 	onekvm_offload_free_crypto(context);
-	kvfree(context->batch_pages);
-	kvfree(context->batch_buffers);
 	memzero_explicit(context->input, ONEKVM_OFFLOAD_MAX_INPUT +
 			 ONEKVM_OFFLOAD_GCM_TAG_SIZE);
+	memzero_explicit(context->batch_data,
+			 ONEKVM_OFFLOAD_BATCH_BUFFER_SIZE);
+	memzero_explicit(context->batch_keystream,
+			 ONEKVM_OFFLOAD_BATCH_BUFFER_SIZE);
+	kfree(context->batch_keystream);
+	kfree(context->batch_data);
 	kfree(context->input);
 	mutex_unlock(&context->lock);
 	kfree(context);
@@ -746,7 +648,11 @@ static const struct file_operations onekvm_offload_file_operations = {
 #ifdef CONFIG_COMPAT
 	.compat_ioctl = onekvm_offload_ioctl,
 #endif
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+	.llseek = noop_llseek,
+#else
 	.llseek = no_llseek,
+#endif
 };
 
 static struct miscdevice onekvm_offload_device = {
@@ -755,15 +661,6 @@ static struct miscdevice onekvm_offload_device = {
 	.fops = &onekvm_offload_file_operations,
 	.mode = 0600,
 };
-
-static struct resource onekvm_spacc_resources[] = {
-	{
-		.start = ONEKVM_SPACC_BASE,
-		.end = ONEKVM_SPACC_BASE + ONEKVM_SPACC_SIZE - 1,
-		.flags = IORESOURCE_MEM,
-	},
-};
-static struct platform_device *onekvm_spacc_platform_device;
 
 static ssize_t tx_packets_show(struct device *device,
 			       struct device_attribute *attribute, char *buffer)
@@ -852,40 +749,20 @@ static int __init onekvm_offload_init(void)
 {
 	int error;
 
-	if (!cvitek_spacc_kernel_api_ready()) {
-		onekvm_spacc_platform_device = platform_device_register_simple(
-			"cvitek_spacc", PLATFORM_DEVID_NONE,
-			onekvm_spacc_resources,
-			ARRAY_SIZE(onekvm_spacc_resources));
-		if (IS_ERR(onekvm_spacc_platform_device)) {
-			error = PTR_ERR(onekvm_spacc_platform_device);
-			onekvm_spacc_platform_device = NULL;
-			return error;
-		}
-	}
-	if (!cvitek_spacc_kernel_api_ready()) {
-		error = -ENODEV;
-		goto unregister_spacc;
-	}
+	if (!cvitek_spacc_kernel_api_ready())
+		return -ENODEV;
 	error = misc_register(&onekvm_offload_device);
 	if (error)
-		goto unregister_spacc;
+		return error;
 	error = sysfs_create_groups(&onekvm_offload_device.this_device->kobj,
 				   onekvm_offload_groups);
 	if (error) {
 		misc_deregister(&onekvm_offload_device);
-		goto unregister_spacc;
+		return error;
 	}
 	pr_info("OneKVM crypto offload ABI v%u registered\n",
 		ONEKVM_OFFLOAD_ABI_VERSION);
 	return 0;
-
-unregister_spacc:
-	if (onekvm_spacc_platform_device) {
-		platform_device_unregister(onekvm_spacc_platform_device);
-		onekvm_spacc_platform_device = NULL;
-	}
-	return error;
 }
 
 static void __exit onekvm_offload_exit(void)
@@ -893,10 +770,6 @@ static void __exit onekvm_offload_exit(void)
 	sysfs_remove_groups(&onekvm_offload_device.this_device->kobj,
 			    onekvm_offload_groups);
 	misc_deregister(&onekvm_offload_device);
-	if (onekvm_spacc_platform_device) {
-		platform_device_unregister(onekvm_spacc_platform_device);
-		onekvm_spacc_platform_device = NULL;
-	}
 }
 
 module_init(onekvm_offload_init);
@@ -905,3 +778,8 @@ module_exit(onekvm_offload_exit);
 MODULE_DESCRIPTION("OneKVM AES-GCM userspace TX offload ABI");
 MODULE_AUTHOR("OneKVM");
 MODULE_LICENSE("GPL");
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+MODULE_IMPORT_NS("CRYPTO_INTERNAL");
+#else
+MODULE_IMPORT_NS(CRYPTO_INTERNAL);
+#endif
