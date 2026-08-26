@@ -7,8 +7,10 @@
 #include <linux/atomic.h>
 #include <linux/crypto.h>
 #include <linux/device.h>
+#include <linux/delay.h>
 #include <linux/fs.h>
 #include <linux/init.h>
+#include <linux/io.h>
 #include <linux/ioctl.h>
 #include <linux/ktime.h>
 #include <linux/miscdevice.h>
@@ -19,9 +21,9 @@
 #include <linux/string.h>
 #include <linux/uaccess.h>
 #include <linux/unaligned.h>
-#include <linux/version.h>
 
 #include "onekvm_sg2002_cryptodma.h"
+#include "onekvm_ghash_ipc.h"
 
 #define ONEKVM_OFFLOAD_NAME "onekvm-crypto-offload"
 #define ONEKVM_OFFLOAD_ABI_VERSION 1
@@ -33,6 +35,13 @@
 #define ONEKVM_OFFLOAD_MAX_INPUT (20 * 1024)
 #define ONEKVM_OFFLOAD_MAX_BATCH 128
 #define ONEKVM_OFFLOAD_BATCH_BUFFER_SIZE (32 * 1024)
+#define ONEKVM_OFFLOAD_RTOS_VERIFY_PACKETS 128
+
+static unsigned int offload_rtos_ghash_timeout_ms = 250;
+module_param_named(rtos_ghash_timeout_ms, offload_rtos_ghash_timeout_ms,
+		   uint, 0644);
+MODULE_PARM_DESC(rtos_ghash_timeout_ms,
+		 "C906L GHASH IPC timeout in milliseconds");
 
 struct onekvm_offload_key_config {
 	__u32 version;
@@ -80,9 +89,11 @@ struct onekvm_offload_context {
 	struct crypto_cipher *aes;
 	u8 *input;
 	u8 *batch_data;
-	u8 *batch_keystream;
+	u8 (*batch_tags)[AES_BLOCK_SIZE];
 	u8 key[AES_MAX_KEY_SIZE];
+	u8 hash_subkey[AES_BLOCK_SIZE];
 	unsigned int key_len;
+	unsigned int rtos_verify_remaining;
 };
 
 static bool onekvm_offload_ranges_overlap(unsigned long first,
@@ -101,8 +112,148 @@ static atomic64_t offload_crypto_ns = ATOMIC64_INIT(0);
 static atomic64_t offload_batch_calls = ATOMIC64_INIT(0);
 static atomic64_t offload_batch_packets = ATOMIC64_INIT(0);
 static atomic64_t offload_batch_unique_pages = ATOMIC64_INIT(0);
+static atomic64_t offload_rtos_ghash_batches = ATOMIC64_INIT(0);
+static atomic64_t offload_rtos_ghash_packets = ATOMIC64_INIT(0);
+static atomic64_t offload_rtos_ghash_bytes = ATOMIC64_INIT(0);
+static atomic64_t offload_rtos_ghash_ns = ATOMIC64_INIT(0);
+static atomic64_t offload_rtos_ghash_verified = ATOMIC64_INIT(0);
+static atomic64_t offload_rtos_ghash_fallbacks = ATOMIC64_INIT(0);
+static atomic64_t offload_rtos_ghash_errors = ATOMIC64_INIT(0);
 static char offload_driver_name[CRYPTO_MAX_ALG_NAME] = "unconfigured";
 static DEFINE_MUTEX(offload_driver_name_lock);
+static DEFINE_MUTEX(offload_rtos_ghash_lock);
+static void __iomem *offload_rtos_ghash_iomem;
+static struct onekvm_ghash_shm __iomem *offload_rtos_ghash_shm;
+static bool offload_rtos_ghash_enabled;
+static u32 offload_rtos_ghash_next_seq = 1;
+
+static void onekvm_offload_disable_rtos_ghash(const char *reason)
+{
+	mutex_lock(&offload_rtos_ghash_lock);
+	if (offload_rtos_ghash_enabled) {
+		offload_rtos_ghash_enabled = false;
+		pr_warn("OneKVM crypto offload: disabling C906L GHASH: %s\n",
+			reason);
+	}
+	mutex_unlock(&offload_rtos_ghash_lock);
+}
+
+static int onekvm_offload_rtos_ghash(
+	struct onekvm_offload_context *context,
+	const struct onekvm_offload_encrypt_request *requests,
+	const unsigned int *data_offsets, unsigned int request_count)
+{
+	struct onekvm_ghash_shm __iomem *shm = offload_rtos_ghash_shm;
+	unsigned int first = 0;
+	int error = 0;
+
+	mutex_lock(&offload_rtos_ghash_lock);
+	if (!offload_rtos_ghash_enabled || !shm) {
+		error = -ENODEV;
+		goto unlock;
+	}
+
+	while (first < request_count) {
+		unsigned int count = 0;
+		unsigned int payload_used = 0;
+		unsigned int index;
+		u64 started_ns;
+		u64 deadline_ns;
+		u64 byte_count = 0;
+		u32 seq;
+
+		while (first + count < request_count &&
+		       count < ONEKVM_GHASH_MAX_REQUESTS) {
+			const struct onekvm_offload_encrypt_request *request =
+				&requests[first + count];
+			u32 length = request->aad_len + request->data_len;
+
+			if (length > ONEKVM_GHASH_PAYLOAD_SIZE - payload_used)
+				break;
+			payload_used += length;
+			count++;
+		}
+		if (!count) {
+			error = -EMSGSIZE;
+			goto unlock;
+		}
+
+		payload_used = 0;
+		memcpy_toio(shm->hash_subkey, context->hash_subkey,
+			    sizeof(context->hash_subkey));
+		for (index = 0; index < count; index++) {
+			const struct onekvm_offload_encrypt_request *request =
+				&requests[first + index];
+			struct onekvm_ghash_request __iomem *rtos_request =
+				&shm->requests[index];
+			void __user *aad_user =
+				(void __user *)(uintptr_t)request->aad_ptr;
+			u32 aad_offset = payload_used;
+			u32 data_offset;
+
+			if (request->aad_len) {
+				if (copy_from_user(context->input, aad_user,
+						   request->aad_len)) {
+					error = -EFAULT;
+					goto unlock;
+				}
+				memcpy_toio(shm->payload + payload_used,
+					    context->input, request->aad_len);
+				payload_used += request->aad_len;
+			}
+			data_offset = payload_used;
+			if (request->data_len) {
+				memcpy_toio(shm->payload + payload_used,
+					    context->batch_data +
+						data_offsets[first + index],
+					    request->data_len);
+				payload_used += request->data_len;
+			}
+			writel(aad_offset, &rtos_request->aad_offset);
+			writel(request->aad_len, &rtos_request->aad_length);
+			writel(data_offset, &rtos_request->data_offset);
+			writel(request->data_len, &rtos_request->data_length);
+			byte_count += request->aad_len + request->data_len;
+		}
+
+		writel(count, &shm->count);
+		writel(payload_used, &shm->payload_used);
+		writel(0, &shm->status);
+		seq = offload_rtos_ghash_next_seq++;
+		if (!seq)
+			seq = offload_rtos_ghash_next_seq++;
+		wmb();
+		started_ns = ktime_get_ns();
+		deadline_ns = started_ns +
+			(u64)READ_ONCE(offload_rtos_ghash_timeout_ms) *
+			NSEC_PER_MSEC;
+		writel(seq, &shm->seq);
+		while (readl(&shm->ack) != seq) {
+			if (ktime_get_ns() >= deadline_ns) {
+				error = -ETIMEDOUT;
+				goto unlock;
+			}
+			usleep_range(50, 100);
+		}
+		rmb();
+		error = (s32)readl(&shm->status);
+		if (error)
+			goto unlock;
+		for (index = 0; index < count; index++)
+			memcpy_fromio(context->batch_tags[first + index],
+				      shm->requests[index].tag, AES_BLOCK_SIZE);
+		atomic64_inc(&offload_rtos_ghash_batches);
+		atomic64_add(count, &offload_rtos_ghash_packets);
+		atomic64_add(byte_count, &offload_rtos_ghash_bytes);
+		atomic64_add(ktime_get_ns() - started_ns,
+			     &offload_rtos_ghash_ns);
+		first += count;
+	}
+
+unlock:
+	mutex_unlock(&offload_rtos_ghash_lock);
+	return error;
+}
 
 static void onekvm_offload_free_crypto(struct onekvm_offload_context *context)
 {
@@ -119,7 +270,9 @@ static void onekvm_offload_free_crypto(struct onekvm_offload_context *context)
 		context->aes = NULL;
 	}
 	memzero_explicit(context->key, sizeof(context->key));
+	memzero_explicit(context->hash_subkey, sizeof(context->hash_subkey));
 	context->key_len = 0;
+	context->rtos_verify_remaining = 0;
 }
 
 static int onekvm_offload_set_key(struct onekvm_offload_context *context,
@@ -177,11 +330,18 @@ static int onekvm_offload_set_key(struct onekvm_offload_context *context,
 	context->ghash_desc = ghash_desc;
 	context->aes = aes;
 	memcpy(context->key, config.key, config.key_len);
+	memcpy(context->hash_subkey, hash_subkey, sizeof(hash_subkey));
 	context->key_len = config.key_len;
+	context->rtos_verify_remaining = ONEKVM_OFFLOAD_RTOS_VERIFY_PACKETS;
 	ghash_driver = crypto_tfm_alg_driver_name(crypto_shash_tfm(ghash));
 	mutex_lock(&offload_driver_name_lock);
-	scnprintf(offload_driver_name, sizeof(offload_driver_name),
-		  "onekvm-gcm(cvitek-spacc,%s)", ghash_driver);
+	if (READ_ONCE(offload_rtos_ghash_enabled))
+		scnprintf(offload_driver_name, sizeof(offload_driver_name),
+			  "onekvm-gcm(cvitek-spacc,ghash-c906l+%s)",
+			  ghash_driver);
+	else
+		scnprintf(offload_driver_name, sizeof(offload_driver_name),
+			  "onekvm-gcm(cvitek-spacc,%s)", ghash_driver);
 	mutex_unlock(&offload_driver_name_lock);
 	pr_info_once("OneKVM crypto offload: AES-GCM CTR=cvitek-spacc GHASH=%s\n",
 		     ghash_driver);
@@ -288,31 +448,38 @@ static int onekvm_offload_validate_encrypt_request(
 	return 0;
 }
 
-static int onekvm_offload_finish_gcm(
+static int onekvm_offload_software_ghash(
 	struct onekvm_offload_context *context,
 	const struct onekvm_offload_encrypt_request *parameters,
-	struct scatterlist *ciphertext)
+	struct scatterlist *ciphertext, u8 *tag)
 {
 	void __user *aad_user =
 		(void __user *)(uintptr_t)parameters->aad_ptr;
+
+	if (parameters->aad_len &&
+	    copy_from_user(context->input, aad_user, parameters->aad_len))
+		return -EFAULT;
+	return onekvm_offload_ghash(context, context->input,
+		parameters->aad_len, ciphertext, parameters->data_len, tag);
+}
+
+static int onekvm_offload_write_gcm_tag(
+	struct onekvm_offload_context *context,
+	const struct onekvm_offload_encrypt_request *parameters,
+	const u8 *raw_tag)
+{
 	void __user *dst_user =
 		(void __user *)(uintptr_t)parameters->dst_ptr;
 	u8 counter[AES_BLOCK_SIZE];
 	u8 tag_mask[AES_BLOCK_SIZE];
 	u8 tag[AES_BLOCK_SIZE];
 	unsigned int index;
-	int error;
+	int error = 0;
 
-	if (parameters->aad_len &&
-	    copy_from_user(context->input, aad_user, parameters->aad_len))
-		return -EFAULT;
 	memcpy(counter, parameters->iv, ONEKVM_OFFLOAD_GCM_IV_SIZE);
 	put_unaligned_be32(1, counter + ONEKVM_OFFLOAD_GCM_IV_SIZE);
 	crypto_cipher_encrypt_one(context->aes, tag_mask, counter);
-	error = onekvm_offload_ghash(context, context->input,
-		parameters->aad_len, ciphertext, parameters->data_len, tag);
-	if (error)
-		goto clear_temporary;
+	memcpy(tag, raw_tag, sizeof(tag));
 	for (index = 0; index < ONEKVM_OFFLOAD_GCM_TAG_SIZE; index++)
 		tag[index] ^= tag_mask[index];
 	if (copy_to_user((u8 __user *)dst_user + parameters->data_len, tag,
@@ -325,6 +492,22 @@ static int onekvm_offload_finish_gcm(
 clear_temporary:
 	memzero_explicit(counter, sizeof(counter));
 	memzero_explicit(tag_mask, sizeof(tag_mask));
+	memzero_explicit(tag, sizeof(tag));
+	return error;
+}
+
+static int onekvm_offload_finish_gcm(
+	struct onekvm_offload_context *context,
+	const struct onekvm_offload_encrypt_request *parameters,
+	struct scatterlist *ciphertext)
+{
+	u8 tag[AES_BLOCK_SIZE];
+	int error;
+
+	error = onekvm_offload_software_ghash(context, parameters,
+					      ciphertext, tag);
+	if (!error)
+		error = onekvm_offload_write_gcm_tag(context, parameters, tag);
 	memzero_explicit(tag, sizeof(tag));
 	return error;
 }
@@ -413,30 +596,23 @@ static int onekvm_offload_encrypt_batch_chunk(
 	unsigned int request_count, unsigned int *completed)
 {
 	unsigned int data_offsets[ONEKVM_OFFLOAD_MAX_BATCH];
-	unsigned int keystream_offsets[ONEKVM_OFFLOAD_MAX_BATCH];
 	unsigned int data_used = 0;
-	unsigned int keystream_used = 0;
 	unsigned int chunk_count = 0;
 	unsigned int request_index;
 	u64 started_ns;
+	bool rtos_tags = false;
 	int error = 0;
 
 	*completed = 0;
 	while (chunk_count < request_count) {
 		const struct onekvm_offload_encrypt_request *request =
 			&requests[chunk_count];
-		unsigned int block_count = DIV_ROUND_UP(request->data_len,
-							 AES_BLOCK_SIZE);
-		unsigned int keystream_length = block_count * AES_BLOCK_SIZE;
 		void __user *src_user =
 			(void __user *)(uintptr_t)request->src_ptr;
 		void __user *dst_user =
 			(void __user *)(uintptr_t)request->dst_ptr;
-		unsigned int block;
 
 		if (data_used + request->data_len >
-				ONEKVM_OFFLOAD_BATCH_BUFFER_SIZE ||
-		    keystream_used + keystream_length >
 				ONEKVM_OFFLOAD_BATCH_BUFFER_SIZE)
 			break;
 		if (request->data_len && request->src_ptr != request->dst_ptr &&
@@ -454,29 +630,51 @@ static int onekvm_offload_encrypt_batch_chunk(
 			goto clear_buffers;
 		}
 		data_offsets[chunk_count] = data_used;
-		keystream_offsets[chunk_count] = keystream_used;
-		for (block = 0; block < block_count; block++) {
-			u8 *counter = context->batch_keystream +
-				keystream_used + block * AES_BLOCK_SIZE;
-
-			memcpy(counter, request->iv, ONEKVM_OFFLOAD_GCM_IV_SIZE);
-			put_unaligned_be32(2 + block,
-				counter + ONEKVM_OFFLOAD_GCM_IV_SIZE);
-		}
 		data_used += request->data_len;
-		keystream_used += keystream_length;
 		chunk_count++;
 	}
 	if (!chunk_count)
 		return -EMSGSIZE;
 
 	started_ns = ktime_get_ns();
-	if (keystream_used) {
-		error = cvitek_spacc_aes_ecb_encrypt(context->batch_keystream,
-			keystream_used, context->key, context->key_len);
+	for (request_index = 0; request_index < chunk_count; request_index++) {
+		const struct onekvm_offload_encrypt_request *request =
+			&requests[request_index];
+		u8 *data = context->batch_data + data_offsets[request_index];
+		struct scatterlist ciphertext;
+		u8 counter[AES_BLOCK_SIZE];
+
+		if (!request->data_len)
+			continue;
+		sg_init_one(&ciphertext, data, request->data_len);
+		memcpy(counter, request->iv, ONEKVM_OFFLOAD_GCM_IV_SIZE);
+		put_unaligned_be32(2, counter + ONEKVM_OFFLOAD_GCM_IV_SIZE);
+		error = cvitek_spacc_aes_ctr_encrypt_sg(
+			&ciphertext, &ciphertext, request->data_len,
+			context->key, context->key_len, counter);
+		memzero_explicit(counter, sizeof(counter));
 		if (error)
 			goto clear_buffers;
 	}
+
+	if (READ_ONCE(offload_rtos_ghash_enabled)) {
+		error = onekvm_offload_rtos_ghash(context, requests,
+						 data_offsets, chunk_count);
+		if (!error) {
+			rtos_tags = true;
+		} else if (error == -EFAULT) {
+			goto clear_buffers;
+		} else {
+			atomic64_inc(&offload_rtos_ghash_errors);
+			atomic64_add(chunk_count,
+				     &offload_rtos_ghash_fallbacks);
+			pr_warn("OneKVM crypto offload: C906L GHASH IPC error %d\n",
+				error);
+			onekvm_offload_disable_rtos_ghash("IPC failure");
+			error = 0;
+		}
+	}
+
 	for (request_index = 0; request_index < chunk_count;
 	     request_index++) {
 		const struct onekvm_offload_encrypt_request *request =
@@ -485,19 +683,41 @@ static int onekvm_offload_encrypt_batch_chunk(
 		void __user *dst_user =
 			(void __user *)(uintptr_t)request->dst_ptr;
 		u8 *data = context->batch_data + data_offsets[request_index];
-		u8 *keystream = context->batch_keystream +
-			keystream_offsets[request_index];
-		unsigned int byte;
+		u8 software_tag[AES_BLOCK_SIZE];
+		const u8 *raw_tag = context->batch_tags[request_index];
 
-		for (byte = 0; byte < request->data_len; byte++)
-			data[byte] ^= keystream[byte];
 		if (request->data_len &&
 		    copy_to_user(dst_user, data, request->data_len)) {
 			error = -EFAULT;
 			goto clear_buffers;
 		}
 		sg_init_one(&ciphertext, data, request->data_len);
-		error = onekvm_offload_finish_gcm(context, request, &ciphertext);
+		if (!rtos_tags || context->rtos_verify_remaining) {
+			error = onekvm_offload_software_ghash(context, request,
+						      &ciphertext, software_tag);
+			if (error) {
+				memzero_explicit(software_tag,
+						 sizeof(software_tag));
+				goto clear_buffers;
+			}
+			if (!rtos_tags) {
+				raw_tag = software_tag;
+			} else if (crypto_memneq(software_tag, raw_tag,
+						 AES_BLOCK_SIZE)) {
+				atomic64_inc(&offload_rtos_ghash_errors);
+				atomic64_add(chunk_count - request_index,
+					     &offload_rtos_ghash_fallbacks);
+				onekvm_offload_disable_rtos_ghash(
+					"verification mismatch");
+				rtos_tags = false;
+				raw_tag = software_tag;
+			} else {
+				context->rtos_verify_remaining--;
+				atomic64_inc(&offload_rtos_ghash_verified);
+			}
+		}
+		error = onekvm_offload_write_gcm_tag(context, request, raw_tag);
+		memzero_explicit(software_tag, sizeof(software_tag));
 		if (error)
 			goto clear_buffers;
 		(*completed)++;
@@ -506,7 +726,6 @@ static int onekvm_offload_encrypt_batch_chunk(
 
 clear_buffers:
 	memzero_explicit(context->batch_data, data_used);
-	memzero_explicit(context->batch_keystream, keystream_used);
 	return error;
 }
 
@@ -600,17 +819,16 @@ static int onekvm_offload_open(struct inode *inode, struct file *file)
 				ONEKVM_OFFLOAD_GCM_TAG_SIZE, GFP_KERNEL);
 	context->batch_data = kmalloc(ONEKVM_OFFLOAD_BATCH_BUFFER_SIZE,
 				      GFP_KERNEL);
-	context->batch_keystream = kmalloc(ONEKVM_OFFLOAD_BATCH_BUFFER_SIZE,
-					   GFP_KERNEL);
-	if (!context->input || !context->batch_data ||
-	    !context->batch_keystream)
+	context->batch_tags = kmalloc_array(ONEKVM_OFFLOAD_MAX_BATCH,
+					    AES_BLOCK_SIZE, GFP_KERNEL);
+	if (!context->input || !context->batch_data || !context->batch_tags)
 		goto free_context;
 	mutex_init(&context->lock);
 	file->private_data = context;
 	return 0;
 
 free_context:
-	kfree(context->batch_keystream);
+	kfree(context->batch_tags);
 	kfree(context->batch_data);
 	kfree(context->input);
 	kfree(context);
@@ -629,9 +847,9 @@ static int onekvm_offload_release(struct inode *inode, struct file *file)
 			 ONEKVM_OFFLOAD_GCM_TAG_SIZE);
 	memzero_explicit(context->batch_data,
 			 ONEKVM_OFFLOAD_BATCH_BUFFER_SIZE);
-	memzero_explicit(context->batch_keystream,
-			 ONEKVM_OFFLOAD_BATCH_BUFFER_SIZE);
-	kfree(context->batch_keystream);
+	memzero_explicit(context->batch_tags,
+			 ONEKVM_OFFLOAD_MAX_BATCH * AES_BLOCK_SIZE);
+	kfree(context->batch_tags);
 	kfree(context->batch_data);
 	kfree(context->input);
 	mutex_unlock(&context->lock);
@@ -648,11 +866,7 @@ static const struct file_operations onekvm_offload_file_operations = {
 #ifdef CONFIG_COMPAT
 	.compat_ioctl = onekvm_offload_ioctl,
 #endif
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
 	.llseek = noop_llseek,
-#else
-	.llseek = no_llseek,
-#endif
 };
 
 static struct miscdevice onekvm_offload_device = {
@@ -720,6 +934,32 @@ static ssize_t batch_unique_pages_show(struct device *device,
 }
 static DEVICE_ATTR_RO(batch_unique_pages);
 
+static ssize_t rtos_ghash_ready_show(struct device *device,
+				     struct device_attribute *attribute,
+				     char *buffer)
+{
+	return scnprintf(buffer, PAGE_SIZE, "%u\n",
+			 READ_ONCE(offload_rtos_ghash_enabled) ? 1 : 0);
+}
+static DEVICE_ATTR_RO(rtos_ghash_ready);
+
+#define ONEKVM_RTOS_GHASH_STAT_ATTR(_name) \
+static ssize_t rtos_ghash_##_name##_show( \
+	struct device *device, struct device_attribute *attribute, char *buffer) \
+{ \
+	return scnprintf(buffer, PAGE_SIZE, "%lld\n", \
+		atomic64_read(&offload_rtos_ghash_##_name)); \
+} \
+static DEVICE_ATTR_RO(rtos_ghash_##_name)
+
+ONEKVM_RTOS_GHASH_STAT_ATTR(batches);
+ONEKVM_RTOS_GHASH_STAT_ATTR(packets);
+ONEKVM_RTOS_GHASH_STAT_ATTR(bytes);
+ONEKVM_RTOS_GHASH_STAT_ATTR(ns);
+ONEKVM_RTOS_GHASH_STAT_ATTR(verified);
+ONEKVM_RTOS_GHASH_STAT_ATTR(fallbacks);
+ONEKVM_RTOS_GHASH_STAT_ATTR(errors);
+
 static ssize_t driver_show(struct device *device,
 			   struct device_attribute *attribute, char *buffer)
 {
@@ -740,6 +980,14 @@ static struct attribute *onekvm_offload_attrs[] = {
 	&dev_attr_batch_calls.attr,
 	&dev_attr_batch_packets.attr,
 	&dev_attr_batch_unique_pages.attr,
+	&dev_attr_rtos_ghash_ready.attr,
+	&dev_attr_rtos_ghash_batches.attr,
+	&dev_attr_rtos_ghash_packets.attr,
+	&dev_attr_rtos_ghash_bytes.attr,
+	&dev_attr_rtos_ghash_ns.attr,
+	&dev_attr_rtos_ghash_verified.attr,
+	&dev_attr_rtos_ghash_fallbacks.attr,
+	&dev_attr_rtos_ghash_errors.attr,
 	&dev_attr_driver.attr,
 	NULL,
 };
@@ -751,13 +999,42 @@ static int __init onekvm_offload_init(void)
 
 	if (!cvitek_spacc_kernel_api_ready())
 		return -ENODEV;
+	offload_rtos_ghash_iomem = ioremap(ONEKVM_GHASH_SHM_PHYS,
+					   ONEKVM_GHASH_SHM_SIZE);
+	if (offload_rtos_ghash_iomem) {
+		offload_rtos_ghash_shm = offload_rtos_ghash_iomem;
+		if (readl(&offload_rtos_ghash_shm->magic) ==
+				ONEKVM_GHASH_SHM_MAGIC &&
+		    readl(&offload_rtos_ghash_shm->version) ==
+				ONEKVM_GHASH_SHM_VERSION &&
+		    readl(&offload_rtos_ghash_shm->size) ==
+				ONEKVM_GHASH_SHM_SIZE &&
+		    readl(&offload_rtos_ghash_shm->max_requests) ==
+				ONEKVM_GHASH_MAX_REQUESTS &&
+		    (readl(&offload_rtos_ghash_shm->flags) &
+				ONEKVM_GHASH_FLAG_READY)) {
+			offload_rtos_ghash_next_seq =
+				readl(&offload_rtos_ghash_shm->ack) + 1;
+			if (!offload_rtos_ghash_next_seq)
+				offload_rtos_ghash_next_seq = 1;
+			offload_rtos_ghash_enabled = true;
+			pr_info("OneKVM crypto offload: C906L GHASH ready\n");
+		} else {
+			pr_info("OneKVM crypto offload: C906L GHASH unavailable, using Linux fallback\n");
+		}
+	}
 	error = misc_register(&onekvm_offload_device);
-	if (error)
+	if (error) {
+		if (offload_rtos_ghash_iomem)
+			iounmap(offload_rtos_ghash_iomem);
 		return error;
+	}
 	error = sysfs_create_groups(&onekvm_offload_device.this_device->kobj,
 				   onekvm_offload_groups);
 	if (error) {
 		misc_deregister(&onekvm_offload_device);
+		if (offload_rtos_ghash_iomem)
+			iounmap(offload_rtos_ghash_iomem);
 		return error;
 	}
 	pr_info("OneKVM crypto offload ABI v%u registered\n",
@@ -767,9 +1044,12 @@ static int __init onekvm_offload_init(void)
 
 static void __exit onekvm_offload_exit(void)
 {
+	WRITE_ONCE(offload_rtos_ghash_enabled, false);
 	sysfs_remove_groups(&onekvm_offload_device.this_device->kobj,
 			    onekvm_offload_groups);
 	misc_deregister(&onekvm_offload_device);
+	if (offload_rtos_ghash_iomem)
+		iounmap(offload_rtos_ghash_iomem);
 }
 
 module_init(onekvm_offload_init);
@@ -778,8 +1058,4 @@ module_exit(onekvm_offload_exit);
 MODULE_DESCRIPTION("OneKVM AES-GCM userspace TX offload ABI");
 MODULE_AUTHOR("OneKVM");
 MODULE_LICENSE("GPL");
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
 MODULE_IMPORT_NS("CRYPTO_INTERNAL");
-#else
-MODULE_IMPORT_NS(CRYPTO_INTERNAL);
-#endif
