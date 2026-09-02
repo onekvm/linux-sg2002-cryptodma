@@ -108,6 +108,7 @@ static bool onekvm_offload_ranges_overlap(unsigned long first,
 static atomic64_t offload_tx_packets = ATOMIC64_INIT(0);
 static atomic64_t offload_tx_bytes = ATOMIC64_INIT(0);
 static atomic64_t offload_tx_errors = ATOMIC64_INIT(0);
+static atomic_t offload_last_error = ATOMIC_INIT(0);
 static atomic64_t offload_crypto_ns = ATOMIC64_INIT(0);
 static atomic64_t offload_batch_calls = ATOMIC64_INIT(0);
 static atomic64_t offload_batch_packets = ATOMIC64_INIT(0);
@@ -792,13 +793,17 @@ static long onekvm_offload_ioctl(struct file *file, unsigned int command,
 		break;
 	case ONEKVM_OFFLOAD_ENCRYPT:
 		result = onekvm_offload_encrypt(context, argument_user);
-		if (result)
+		if (result) {
 			atomic64_inc(&offload_tx_errors);
+			atomic_set(&offload_last_error, result);
+		}
 		break;
 	case ONEKVM_OFFLOAD_ENCRYPT_BATCH:
 		result = onekvm_offload_encrypt_batch(context, argument_user);
-		if (result)
+		if (result) {
 			atomic64_inc(&offload_tx_errors);
+			atomic_set(&offload_last_error, result);
+		}
 		break;
 	default:
 		result = -ENOTTY;
@@ -900,6 +905,14 @@ static ssize_t tx_errors_show(struct device *device,
 }
 static DEVICE_ATTR_RO(tx_errors);
 
+static ssize_t last_error_show(struct device *device,
+			       struct device_attribute *attribute, char *buffer)
+{
+	return scnprintf(buffer, PAGE_SIZE, "%d\n",
+			 atomic_read(&offload_last_error));
+}
+static DEVICE_ATTR_RO(last_error);
+
 static ssize_t crypto_ns_show(struct device *device,
 			      struct device_attribute *attribute, char *buffer)
 {
@@ -976,6 +989,7 @@ static struct attribute *onekvm_offload_attrs[] = {
 	&dev_attr_tx_packets.attr,
 	&dev_attr_tx_bytes.attr,
 	&dev_attr_tx_errors.attr,
+	&dev_attr_last_error.attr,
 	&dev_attr_crypto_ns.attr,
 	&dev_attr_batch_calls.attr,
 	&dev_attr_batch_packets.attr,
