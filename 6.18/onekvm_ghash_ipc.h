@@ -8,9 +8,14 @@
 #define ONEKVM_GHASH_SHM_PHYS 0x8FFE0000UL
 #define ONEKVM_GHASH_SHM_SIZE 0x00010000UL
 #define ONEKVM_GHASH_SHM_MAGIC 0x54524847U /* 'GHRT' */
-#define ONEKVM_GHASH_SHM_VERSION 1U
-#define ONEKVM_GHASH_MAX_REQUESTS 128U
+#define ONEKVM_GHASH_SHM_VERSION 2U
+#define ONEKVM_GHASH_MAX_REQUESTS 32U
+#define ONEKVM_GHASH_RING_SLOTS 4U
 #define ONEKVM_GHASH_FLAG_READY (1U << 0)
+
+#define ONEKVM_GHASH_SLOT_EMPTY 0U
+#define ONEKVM_GHASH_SLOT_READY 1U
+#define ONEKVM_GHASH_SLOT_DONE 2U
 
 struct onekvm_ghash_request {
 	u32 aad_offset;
@@ -20,37 +25,48 @@ struct onekvm_ghash_request {
 	u8 tag[16];
 };
 
-#define ONEKVM_GHASH_HEADER_SIZE 96U
-#define ONEKVM_GHASH_REQUESTS_SIZE \
-	(sizeof(struct onekvm_ghash_request) * ONEKVM_GHASH_MAX_REQUESTS)
-#define ONEKVM_GHASH_PAYLOAD_SIZE \
-	(ONEKVM_GHASH_SHM_SIZE - ONEKVM_GHASH_HEADER_SIZE - \
-	 ONEKVM_GHASH_REQUESTS_SIZE)
+#define ONEKVM_GHASH_RING_HDR 128U
+#define ONEKVM_GHASH_SLOT_SIZE \
+	((ONEKVM_GHASH_SHM_SIZE - ONEKVM_GHASH_RING_HDR) / \
+	 ONEKVM_GHASH_RING_SLOTS)
+#define ONEKVM_GHASH_SLOT_HDR 1072U
+#define ONEKVM_GHASH_SLOT_PAYLOAD \
+	(ONEKVM_GHASH_SLOT_SIZE - ONEKVM_GHASH_SLOT_HDR)
+
+struct onekvm_ghash_slot {
+	u32 seq;
+	u32 state;
+	s32 status;
+	u32 count;
+	u32 payload_used;
+	u8 hash_subkey[16];
+	u32 payload_phys;
+	u32 reserved[2];
+	struct onekvm_ghash_request requests[ONEKVM_GHASH_MAX_REQUESTS];
+	u8 payload[ONEKVM_GHASH_SLOT_PAYLOAD];
+};
 
 struct onekvm_ghash_shm {
 	u32 magic;
 	u32 version;
 	u32 size;
 	u32 flags;
-	u32 seq;
-	u32 ack;
-	s32 status;
-	u32 count;
-	u32 payload_used;
-	u32 max_requests;
-	u8 hash_subkey[16];
-	u32 reserved[2];
+	u32 prod;
+	u32 cons;
+	u32 done;
+	u32 slot_count;
 	u64 jobs;
 	u64 packets;
 	u64 ticks;
 	u64 errors;
-	struct onekvm_ghash_request requests[ONEKVM_GHASH_MAX_REQUESTS];
-	u8 payload[ONEKVM_GHASH_PAYLOAD_SIZE];
+	u32 reserved[16];
+	struct onekvm_ghash_slot slots[ONEKVM_GHASH_RING_SLOTS];
 };
 
 static_assert(sizeof(struct onekvm_ghash_request) == 32);
-static_assert(offsetof(struct onekvm_ghash_shm, requests) ==
-	      ONEKVM_GHASH_HEADER_SIZE);
+static_assert(sizeof(struct onekvm_ghash_slot) == ONEKVM_GHASH_SLOT_SIZE);
+static_assert(offsetof(struct onekvm_ghash_shm, slots) ==
+	      ONEKVM_GHASH_RING_HDR);
 static_assert(sizeof(struct onekvm_ghash_shm) == ONEKVM_GHASH_SHM_SIZE);
 
 #endif
